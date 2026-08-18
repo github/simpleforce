@@ -389,7 +389,7 @@ func (client *Client) IntrospectSessionToken(clientSecret string) (*IntrospectRe
 		"token_type_hint": {"access_token"},
 	}
 
-	resp, err := httpClient.PostForm(introspectURL, data)
+resp, err := httpClient.PostForm(introspectURL, data)
 	if err != nil {
 		return nil, err
 	}
@@ -398,6 +398,9 @@ func (client *Client) IntrospectSessionToken(clientSecret string) (*IntrospectRe
 	respData, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("token introspection failed with HTTP status %d", resp.StatusCode)
 	}
 
 	var introspectResult IntrospectResult
