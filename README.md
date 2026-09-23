@@ -278,21 +278,20 @@ The unit test requires a custom field `customExtIdField__c` to be present on the
 
 ### Sandbox Bulk Update Example
 
-`examples/bulk-update` sends two records in one request: one valid update and one update with an intentionally invalid
-field. Use a disposable sandbox record because the successful update modifies it.
+`examples/bulk-update` creates two temporary Accounts, then sends one valid update and one intentionally invalid update
+in a single request. It prints the per-record results and deletes both test Accounts before exiting.
 
 ```sh
 export SF_URL=https://test.salesforce.com
 export SF_USER='sandbox-user@example.com.sandbox'
 export SF_PASS='password'
 export SF_TOKEN='security-token'
-export SF_RECORD_ID='001...'
 
 go run ./examples/bulk-update
 ```
 
-The example updates an Account's `Description` by default. Set `SF_OBJECT_TYPE`, `SF_FIELD`, and `SF_VALUE` to use a
-different writable record and field. `SF_CLIENT_ID` and `SF_API_VERSION` are also optional.
+`SF_VALUE` optionally sets the successful Account `Description` update. `SF_CLIENT_ID` and `SF_API_VERSION` are also
+optional.
 
 ## License and Acknowledgement
 
