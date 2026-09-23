@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	neturl "net/url"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -15,6 +17,7 @@ const (
 	sobjectAttributesKey          = "attributes" // points to the attributes structure which should be common to all SObjects.
 	sobjectIDKey                  = "Id"
 	sobjectExternalIDFieldNameKey = "ExternalIDField"
+	maxSObjectCollectionSize      = 200
 )
 
 var (
@@ -51,6 +54,28 @@ type SObjectMeta map[string]interface{}
 type SObjectAttributes struct {
 	Type string `json:"type"`
 	URL  string `json:"url"`
+}
+
+// SObjectUpdateError describes an error returned for one record in an SObject collection update.
+type SObjectUpdateError struct {
+	StatusCode string   `json:"statusCode"`
+	Message    string   `json:"message"`
+	Fields     []string `json:"fields"`
+}
+
+// SObjectUpdateResult describes the result for one record in an SObject collection update.
+type SObjectUpdateResult struct {
+	ID      string               `json:"id"`
+	Success bool                 `json:"success"`
+	Errors  []SObjectUpdateError `json:"errors"`
+}
+
+// SObjectUpsertResult describes the result for one record in an SObject collection upsert.
+type SObjectUpsertResult struct {
+	ID      string               `json:"id"`
+	Success bool                 `json:"success"`
+	Created bool                 `json:"created"`
+	Errors  []SObjectUpdateError `json:"errors"`
 }
 
 // Describe queries the metadata of an SObject using the "describe" API.
@@ -175,13 +200,75 @@ func (obj *SObject) Update() *SObject {
 	return obj
 }
 
+// Update updates up to 200 SObjects in a single API call. Results are returned in the same order as objects.
+// If allOrNone is true, Salesforce rolls back all changes when any record fails.
+// Ref: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_update.htm
+func (client *Client) Update(objects []*SObject, allOrNone bool) ([]SObjectUpdateResult, error) {
+	if client == nil {
+		return nil, errors.New("client is required")
+	}
+	if !client.isLoggedIn() {
+		return nil, ErrAuthentication
+	}
+	if len(objects) == 0 || len(objects) > maxSObjectCollectionSize {
+		return nil, errors.Errorf("sobject collection must contain between 1 and %d records", maxSObjectCollectionSize)
+	}
+
+	records := make([]map[string]interface{}, len(objects))
+	for index, obj := range objects {
+		if obj == nil {
+			return nil, errors.Errorf("sobject at index %d is nil", index)
+		}
+		if obj.Type() == "" {
+			return nil, errors.Errorf("sobject at index %d is missing a type", index)
+		}
+		if obj.ID() == "" {
+			return nil, errors.Errorf("sobject at index %d is missing an ID", index)
+		}
+
+		record := obj.makeCopy()
+		record[sobjectAttributesKey] = map[string]string{"type": obj.Type()}
+		record["id"] = obj.ID()
+		records[index] = record
+	}
+
+	request := struct {
+		AllOrNone bool                     `json:"allOrNone"`
+		Records   []map[string]interface{} `json:"records"`
+	}{
+		AllOrNone: allOrNone,
+		Records:   records,
+	}
+	reqData, err := json.Marshal(request)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to convert sobject collection to json")
+	}
+
+	url := client.makeURL("composite/sobjects/")
+	respData, err := client.httpRequest(http.MethodPatch, url, bytes.NewReader(reqData))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to update sobject collection")
+	}
+
+	var results []SObjectUpdateResult
+	if err := json.Unmarshal(respData, &results); err != nil {
+		return nil, errors.Wrap(err, "failed to parse sobject collection response")
+	}
+	return results, nil
+}
+
+// UpdateSObjects is an explicit alias for Update.
+func (client *Client) UpdateSObjects(objects []*SObject, allOrNone bool) ([]SObjectUpdateResult, error) {
+	return client.Update(objects, allOrNone)
+}
+
 // Upsert creates SObject or updates existing SObject in place. Upon successful upsert, same SObject is returned for chained access.
 // ID, ExternalIDField and Type are required. ID is the value of the external ID in this case.
 func (obj *SObject) Upsert() *SObject {
 	log.Println(logPrefix, "ExternalID:", obj.ExternalID())
 	log.Println(logPrefix, "ExternalIDField:", obj.ExternalIDFieldName())
 	if obj.Type() == "" || obj.client() == nil || obj.ExternalIDFieldName() == "" ||
-		obj.ExternalID() == "" {
+		!obj.hasExternalID() {
 		// Sanity check.
 		log.Println(logPrefix, "required fields are missing")
 		return nil
@@ -200,7 +287,7 @@ func (obj *SObject) Upsert() *SObject {
 		queryBase = "tooling/sobjects/"
 	}
 	url := obj.client().
-		makeURL(queryBase + obj.Type() + "/" + obj.ExternalIDFieldName() + "/" + obj.ExternalID())
+		makeURL(queryBase + obj.Type() + "/" + obj.ExternalIDFieldName() + "/" + neturl.PathEscape(obj.ExternalID()))
 	respData, err := obj.client().httpRequest(http.MethodPatch, url, bytes.NewReader(reqData))
 	if err != nil {
 		log.Println(logPrefix, "failed to process http request,", err)
@@ -218,6 +305,88 @@ func (obj *SObject) Upsert() *SObject {
 	}
 
 	return obj
+}
+
+// Upsert creates or updates up to 200 SObjects by external ID in a single API call.
+// All objects must have the same type and ExternalIDField. Results are returned in the same order as objects.
+// If allOrNone is true, Salesforce rolls back all changes when any record fails.
+// Ref: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite_sobjects_collections_upsert.htm
+func (client *Client) Upsert(objects []*SObject, allOrNone bool) ([]SObjectUpsertResult, error) {
+	if client == nil {
+		return nil, errors.New("client is required")
+	}
+	if !client.isLoggedIn() {
+		return nil, ErrAuthentication
+	}
+	if len(objects) == 0 || len(objects) > maxSObjectCollectionSize {
+		return nil, errors.Errorf("sobject collection must contain between 1 and %d records", maxSObjectCollectionSize)
+	}
+
+	var objectType string
+	var externalIDField string
+	records := make([]map[string]interface{}, len(objects))
+	for index, obj := range objects {
+		if obj == nil {
+			return nil, errors.Errorf("sobject at index %d is nil", index)
+		}
+		if obj.Type() == "" {
+			return nil, errors.Errorf("sobject at index %d is missing a type", index)
+		}
+		if obj.ExternalIDFieldName() == "" {
+			return nil, errors.Errorf("sobject at index %d is missing ExternalIDField", index)
+		}
+		if !obj.hasExternalID() {
+			return nil, errors.Errorf("sobject at index %d is missing external ID value", index)
+		}
+
+		if index == 0 {
+			objectType = obj.Type()
+			externalIDField = obj.ExternalIDFieldName()
+		} else if obj.Type() != objectType {
+			return nil, errors.Errorf("sobject at index %d has type %q; expected %q", index, obj.Type(), objectType)
+		} else if obj.ExternalIDFieldName() != externalIDField {
+			return nil, errors.Errorf(
+				"sobject at index %d uses external ID field %q; expected %q",
+				index,
+				obj.ExternalIDFieldName(),
+				externalIDField,
+			)
+		}
+
+		record := obj.makeCopy()
+		record[sobjectAttributesKey] = map[string]string{"type": objectType}
+		record[externalIDField] = obj.ExternalIDValue()
+		records[index] = record
+	}
+
+	request := struct {
+		AllOrNone bool                     `json:"allOrNone"`
+		Records   []map[string]interface{} `json:"records"`
+	}{
+		AllOrNone: allOrNone,
+		Records:   records,
+	}
+	reqData, err := json.Marshal(request)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to convert sobject collection to json")
+	}
+
+	url := client.makeURL("composite/sobjects/" + objectType + "/" + externalIDField)
+	respData, err := client.httpRequest(http.MethodPatch, url, bytes.NewReader(reqData))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to upsert sobject collection")
+	}
+
+	var results []SObjectUpsertResult
+	if err := json.Unmarshal(respData, &results); err != nil {
+		return nil, errors.Wrap(err, "failed to parse sobject collection response")
+	}
+	return results, nil
+}
+
+// UpsertSObjects is an explicit alias for Upsert.
+func (client *Client) UpsertSObjects(objects []*SObject, allOrNone bool) ([]SObjectUpsertResult, error) {
+	return client.Upsert(objects, allOrNone)
 }
 
 // Delete deletes an SObject record identified by external ID. nil is returned if the operation completes successfully;
@@ -265,9 +434,60 @@ func (obj *SObject) ExternalIDFieldName() string {
 	return obj.StringField(sobjectExternalIDFieldNameKey)
 }
 
-// ExternalID returns the external ID of the SObject.
+// ExternalID returns the external ID as a string for use in Salesforce resource URLs.
 func (obj *SObject) ExternalID() string {
-	return obj.StringField(obj.ExternalIDFieldName())
+	value := obj.ExternalIDValue()
+	switch value := value.(type) {
+	case string:
+		return value
+	case json.Number:
+		return value.String()
+	case int:
+		return strconv.FormatInt(int64(value), 10)
+	case int8:
+		return strconv.FormatInt(int64(value), 10)
+	case int16:
+		return strconv.FormatInt(int64(value), 10)
+	case int32:
+		return strconv.FormatInt(int64(value), 10)
+	case int64:
+		return strconv.FormatInt(value, 10)
+	case uint:
+		return strconv.FormatUint(uint64(value), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(value), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(value), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(value), 10)
+	case uint64:
+		return strconv.FormatUint(value, 10)
+	case float32:
+		return strconv.FormatFloat(float64(value), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(value, 'f', -1, 64)
+	default:
+		return ""
+	}
+}
+
+// ExternalIDValue returns the external ID with its original type.
+func (obj *SObject) ExternalIDValue() interface{} {
+	if obj.ExternalIDFieldName() == "" {
+		return nil
+	}
+	return obj.InterfaceField(obj.ExternalIDFieldName())
+}
+
+func (obj *SObject) hasExternalID() bool {
+	value := obj.ExternalIDValue()
+	if value == nil {
+		return false
+	}
+	if stringValue, ok := value.(string); ok {
+		return stringValue != ""
+	}
+	return obj.ExternalID() != ""
 }
 
 // StringField accesses a field in the SObject as string. Empty string is returned if the field doesn't exist.
