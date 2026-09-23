@@ -202,7 +202,7 @@ func WorkWithRecords() {
 			Set("FirstName", "First Contact"),
 		client.SObject("Contact").
 			Set("ExternalIDField", "customExtIdField__c").
-			Set("customExtIdField__c", "__EXT_ID_2__").
+			Set("customExtIdField__c", 1002). // Numeric external IDs retain their JSON number type.
 			Set("FirstName", "Second Contact"),
 	}, false)
 	if err != nil {

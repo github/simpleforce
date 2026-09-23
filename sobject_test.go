@@ -391,6 +391,40 @@ func TestSObject_Upsert(t *testing.T) {
 	}
 }
 
+func TestSObject_UpsertNumericExternalID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPatch {
+			t.Errorf("method = %s, want PATCH", request.Method)
+		}
+		if request.URL.Path != "/services/data/v54.0/sobjects/Account/External_Key__c/0" {
+			t.Errorf(
+				"path = %s, want /services/data/v54.0/sobjects/Account/External_Key__c/0",
+				request.URL.Path,
+			)
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, DefaultClientID, DefaultAPIVersion)
+	client.instanceURL = server.URL
+	client.sessionID = "test-session"
+	obj := client.SObject("Account").
+		Set("ExternalIDField", "External_Key__c").
+		Set("External_Key__c", 0).
+		Set("Name", "Numeric external ID")
+
+	if obj.ExternalID() != "0" {
+		t.Fatalf("ExternalID() = %q, want 0", obj.ExternalID())
+	}
+	if obj.ExternalIDValue() != 0 {
+		t.Fatalf("ExternalIDValue() = %#v, want 0", obj.ExternalIDValue())
+	}
+	if obj.Upsert() != obj {
+		t.Fatal("numeric external ID upsert failed")
+	}
+}
+
 func TestClient_Upsert(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPatch {
@@ -422,7 +456,7 @@ func TestClient_Upsert(t *testing.T) {
 		if !ok || attributes["type"] != "Account" {
 			t.Errorf("attributes = %#v, want Account type", first["attributes"])
 		}
-		if first["External_Key__c"] != "account-1" || first["Name"] != "First account" {
+		if first["External_Key__c"] != float64(1001) || first["Name"] != "First account" {
 			t.Errorf("first record = %#v", first)
 		}
 		if _, ok := first[sobjectExternalIDFieldNameKey]; ok {
@@ -448,7 +482,7 @@ func TestClient_Upsert(t *testing.T) {
 	objects := []*SObject{
 		client.SObject("Account").
 			Set("ExternalIDField", "External_Key__c").
-			Set("External_Key__c", "account-1").
+			Set("External_Key__c", 1001).
 			Set("Name", "First account"),
 		client.SObject("Account").
 			Set("ExternalIDField", "External_Key__c").

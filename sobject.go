@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	neturl "net/url"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -266,7 +268,7 @@ func (obj *SObject) Upsert() *SObject {
 	log.Println(logPrefix, "ExternalID:", obj.ExternalID())
 	log.Println(logPrefix, "ExternalIDField:", obj.ExternalIDFieldName())
 	if obj.Type() == "" || obj.client() == nil || obj.ExternalIDFieldName() == "" ||
-		obj.ExternalID() == "" {
+		!obj.hasExternalID() {
 		// Sanity check.
 		log.Println(logPrefix, "required fields are missing")
 		return nil
@@ -285,7 +287,7 @@ func (obj *SObject) Upsert() *SObject {
 		queryBase = "tooling/sobjects/"
 	}
 	url := obj.client().
-		makeURL(queryBase + obj.Type() + "/" + obj.ExternalIDFieldName() + "/" + obj.ExternalID())
+		makeURL(queryBase + obj.Type() + "/" + obj.ExternalIDFieldName() + "/" + neturl.PathEscape(obj.ExternalID()))
 	respData, err := obj.client().httpRequest(http.MethodPatch, url, bytes.NewReader(reqData))
 	if err != nil {
 		log.Println(logPrefix, "failed to process http request,", err)
@@ -333,7 +335,7 @@ func (client *Client) Upsert(objects []*SObject, allOrNone bool) ([]SObjectUpser
 		if obj.ExternalIDFieldName() == "" {
 			return nil, errors.Errorf("sobject at index %d is missing ExternalIDField", index)
 		}
-		if obj.ExternalID() == "" {
+		if !obj.hasExternalID() {
 			return nil, errors.Errorf("sobject at index %d is missing external ID value", index)
 		}
 
@@ -353,7 +355,7 @@ func (client *Client) Upsert(objects []*SObject, allOrNone bool) ([]SObjectUpser
 
 		record := obj.makeCopy()
 		record[sobjectAttributesKey] = map[string]string{"type": objectType}
-		record[externalIDField] = obj.ExternalID()
+		record[externalIDField] = obj.ExternalIDValue()
 		records[index] = record
 	}
 
@@ -432,9 +434,60 @@ func (obj *SObject) ExternalIDFieldName() string {
 	return obj.StringField(sobjectExternalIDFieldNameKey)
 }
 
-// ExternalID returns the external ID of the SObject.
+// ExternalID returns the external ID as a string for use in Salesforce resource URLs.
 func (obj *SObject) ExternalID() string {
-	return obj.StringField(obj.ExternalIDFieldName())
+	value := obj.ExternalIDValue()
+	switch value := value.(type) {
+	case string:
+		return value
+	case json.Number:
+		return value.String()
+	case int:
+		return strconv.FormatInt(int64(value), 10)
+	case int8:
+		return strconv.FormatInt(int64(value), 10)
+	case int16:
+		return strconv.FormatInt(int64(value), 10)
+	case int32:
+		return strconv.FormatInt(int64(value), 10)
+	case int64:
+		return strconv.FormatInt(value, 10)
+	case uint:
+		return strconv.FormatUint(uint64(value), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(value), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(value), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(value), 10)
+	case uint64:
+		return strconv.FormatUint(value, 10)
+	case float32:
+		return strconv.FormatFloat(float64(value), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(value, 'f', -1, 64)
+	default:
+		return ""
+	}
+}
+
+// ExternalIDValue returns the external ID with its original type.
+func (obj *SObject) ExternalIDValue() interface{} {
+	if obj.ExternalIDFieldName() == "" {
+		return nil
+	}
+	return obj.InterfaceField(obj.ExternalIDFieldName())
+}
+
+func (obj *SObject) hasExternalID() bool {
+	value := obj.ExternalIDValue()
+	if value == nil {
+		return false
+	}
+	if stringValue, ok := value.(string); ok {
+		return stringValue != ""
+	}
+	return obj.ExternalID() != ""
 }
 
 // StringField accesses a field in the SObject as string. Empty string is returned if the field doesn't exist.
