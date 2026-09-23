@@ -13,6 +13,7 @@ Currently, the following functions are implemented and more features could be ad
 - Get records via record (sobject) type and ID
 - Create records
 - Update records
+- Update multiple records in one API call
 - Delete records
 - Upsert (create or update) records based on an external ID
 - Download a file
@@ -162,6 +163,23 @@ func WorkWithRecords() {
 		Update()														// Update the record on Salesforce server.
 	fmt.Println(updateObj)
 
+	// Update up to 200 records in one API call. Results correspond to records by index.
+	results, err := client.Update([]*simpleforce.SObject{
+		client.SObject("Contact").
+			Set("Id", "__CONTACT_ID__").
+			Set("FirstName", "New Name"),
+		client.SObject("Case").
+			Set("Id", "__CASE_ID__").
+			Set("Subject", "New Subject"),
+	}, false)
+	if err != nil {
+		// The request failed before Salesforce could return per-record results.
+		return
+	}
+	for _, result := range results {
+		fmt.Println(result.ID, result.Success, result.Errors)
+	}
+
 	// For Upsert(), start with a blank SObject.
 	// Upsert will create the object if it does not already exist and will update the object if it already exists.
 	// Set "ExternalIDField" to the name of your external ID field
@@ -174,6 +192,25 @@ func WorkWithRecords() {
 		Set("FirstName", "New Name").										// Set any updated fields.
 		Upsert()																				// Update the record on Salesforce server.
 	fmt.Println(upsertObj)
+
+	// Upsert up to 200 records of the same type in one API call. All records must use the same external ID field.
+	upsertResults, err := client.Upsert([]*simpleforce.SObject{
+		client.SObject("Contact").
+			Set("ExternalIDField", "customExtIdField__c").
+			Set("customExtIdField__c", "__EXT_ID_1__").
+			Set("FirstName", "First Contact"),
+		client.SObject("Contact").
+			Set("ExternalIDField", "customExtIdField__c").
+			Set("customExtIdField__c", "__EXT_ID_2__").
+			Set("FirstName", "Second Contact"),
+	}, false)
+	if err != nil {
+		// The request failed before Salesforce could return per-record results.
+		return
+	}
+	for _, result := range upsertResults {
+		fmt.Println(result.ID, result.Success, result.Created, result.Errors)
+	}
 
 	// Many SObject methods return the instance of the SObject, allowing chained access and operations to the
 	// object. In the following example, all methods, except "Delete", returns *SObject so that the next method
@@ -237,6 +274,24 @@ unit tests with a production instance of Salesforce as it would create, modify a
 Salesforce account.
 
 The unit test requires a custom field `customExtIdField__c` to be present on the Type `Case` in your Salesforce setup.
+
+### Sandbox Bulk Update Example
+
+`examples/bulk-update` sends two records in one request: one valid update and one update with an intentionally invalid
+field. Use a disposable sandbox record because the successful update modifies it.
+
+```sh
+export SF_URL=https://test.salesforce.com
+export SF_USER='sandbox-user@example.com.sandbox'
+export SF_PASS='password'
+export SF_TOKEN='security-token'
+export SF_RECORD_ID='001...'
+
+go run ./examples/bulk-update
+```
+
+The example updates an Account's `Description` by default. Set `SF_OBJECT_TYPE`, `SF_FIELD`, and `SF_VALUE` to use a
+different writable record and field. `SF_CLIENT_ID` and `SF_API_VERSION` are also optional.
 
 ## License and Acknowledgement
 
