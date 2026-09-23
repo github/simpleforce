@@ -14,6 +14,7 @@ Currently, the following functions are implemented and more features could be ad
 - Create records
 - Update records
 - Update multiple records in one API call
+- Upsert multiple records in one API call
 - Delete records
 - Upsert (create or update) records based on an external ID
 - Download a file
