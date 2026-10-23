@@ -2,6 +2,7 @@ package simpleforce
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -240,15 +241,7 @@ func (client *Client) LoginPassword(username, password, token string) error {
 
 // httpRequest executes an HTTP request to the salesforce server and returns the response data in byte buffer.
 func (client *Client) httpRequest(method, url string, body io.Reader) ([]byte, error) {
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", client.sessionID))
-	req.Header.Add("Content-Type", "application/json")
-
-	resp, err := client.httpClient.Do(req)
+	resp, err := client.requestContext(context.Background(), method, url, body, "")
 	if err != nil {
 		return nil, err
 	}
@@ -265,6 +258,21 @@ func (client *Client) httpRequest(method, url string, body io.Reader) ([]byte, e
 	}
 
 	return ioutil.ReadAll(resp.Body)
+}
+
+// requestContext is shared by buffered legacy APIs and streaming query APIs.
+func (client *Client) requestContext(ctx context.Context, method, endpoint string, body io.Reader, accept string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", client.sessionID))
+	req.Header.Add("Content-Type", "application/json")
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	return client.httpClient.Do(req)
 }
 
 // makeURL generates a REST API URL based on baseURL, APIVersion of the client.
