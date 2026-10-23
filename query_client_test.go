@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -162,7 +163,9 @@ func TestQueryRefreshAndRetryUsage(t *testing.T) {
 			if rejected != "token" {
 				t.Errorf("rejected SID = %s", rejected)
 			}
-			client.SetSidLoc("fresh", client.GetLoc())
+			fresh := *client
+			fresh.SetSidLoc("fresh", client.GetLoc())
+			return &fresh, nil
 		}
 		return client, nil
 	}
@@ -442,7 +445,9 @@ func TestBulkQueryRefreshAndReadRetries(t *testing.T) {
 	q.getClient = func(_ context.Context, rejected string) (*Client, error) {
 		if rejected != "" {
 			refreshes++
-			client.SetSidLoc("fresh", client.GetLoc())
+			fresh := *client
+			fresh.SetSidLoc("fresh", client.GetLoc())
+			return &fresh, nil
 		}
 		return client, nil
 	}
@@ -498,11 +503,11 @@ func TestBulkEmptyResultsAndCallbackFailure(t *testing.T) {
 func TestDescribeAndProviderErrors(t *testing.T) {
 	q, _ := testQueries(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(400)
-		fmt.Fprint(w, `[{"errorCode":"INVALID_TYPE"}]`)
+		fmt.Fprint(w, `[{"errorCode":"INVALID_TYPE","message":"unknown object"}]`)
 	}, QueryOptions{})
 	_, err := q.Describe(context.Background(), "Product2")
 	var sfErr SalesforceError
-	if !errors.As(err, &sfErr) || sfErr.HttpCode != 400 || q.Usage().DescribeCalls != 1 {
+	if !errors.As(err, &sfErr) || sfErr.HttpCode != 400 || sfErr.ErrorCode != "INVALID_TYPE" || sfErr.ErrorMessage != "unknown object" || q.Usage().DescribeCalls != 1 {
 		t.Fatalf("error=%v usage=%+v", err, q.Usage())
 	}
 	want := errors.New("get client failed")
@@ -513,5 +518,170 @@ func TestDescribeAndProviderErrors(t *testing.T) {
 	q.getClient = func(context.Context, string) (*Client, error) { return nil, nil }
 	if _, err := q.Describe(context.Background(), "Product2"); !errors.Is(err, ErrAuthentication) {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestBulkCSVNewlineNormalization(t *testing.T) {
+	for _, test := range []struct {
+		name, input, want string
+	}{
+		{"LF records CRLF value", "Description\n\"line1\r\nline2\"\n", "line1\nline2"},
+		{"CRLF records CRLF value", "Description\r\n\"line1\r\nline2\"\r\n", "line1\nline2"},
+		{"LF value", "Description\n\"line1\nline2\"\n", "line1\nline2"},
+		{"bare CR value", "Description\n\"line1\rline2\"\n", "line1\rline2"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var got string
+			count, err := readBulkPage(context.Background(), strings.NewReader(test.input), []string{"Description"}, func(row map[string]string) error {
+				got = row["Description"]
+				return nil
+			})
+			if err != nil || count != 1 || got != test.want {
+				t.Fatalf("count=%d value=%q error=%v", count, got, err)
+			}
+		})
+	}
+}
+
+type unfinishedJSONBody struct {
+	reader *strings.Reader
+	err    error
+}
+
+func (b unfinishedJSONBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	if err == io.EOF {
+		return n, b.err
+	}
+	return n, err
+}
+
+func (b unfinishedJSONBody) Close() error { return nil }
+
+func TestQueryJSONRequiresEOF(t *testing.T) {
+	for _, operation := range []string{"rest", "describe", "bulk_create", "bulk_poll"} {
+		for _, test := range []struct {
+			name, suffix string
+			streamErr    error
+		}{
+			{"valid whitespace", " \r\n\t", io.EOF},
+			{"second document", " {}", io.EOF},
+			{"trailing junk", " invalid", io.EOF},
+			{"truncated body", "", io.ErrUnexpectedEOF},
+		} {
+			t.Run(operation+"/"+test.name, func(t *testing.T) {
+				q, client := testQueries(t, func(http.ResponseWriter, *http.Request) {}, QueryOptions{})
+				client.SetHttpClient(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: 200,
+						Header:     make(http.Header),
+						Body: unfinishedJSONBody{
+							reader: strings.NewReader(`{"totalSize":0,"done":true,"records":[]}` + test.suffix),
+							err:    test.streamErr,
+						},
+					}, nil
+				})})
+				var value interface{}
+				err := q.json(context.Background(), operation, http.MethodGet, "query", nil, &value)
+				valid := test.name == "valid whitespace"
+				if valid && err != nil || !valid && err == nil {
+					t.Fatalf("error=%v", err)
+				}
+				if test.streamErr == io.ErrUnexpectedEOF && !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("stream error lost: %v", err)
+				}
+				if q.Usage().TotalCalls() != 1 || q.Usage().Retries != 0 {
+					t.Fatalf("body was retried: %+v", q.Usage())
+				}
+			})
+		}
+	}
+}
+
+func TestQueryRejectsCountOnlyBeforeRequest(t *testing.T) {
+	q, _ := testQueries(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"totalSize":1,"done":true,"records":[{"expr0":3}]}`)
+	}, QueryOptions{})
+	for _, soql := range []string{
+		"SELECT COUNT() FROM Account",
+		" select count ( )\n from Account WHERE Name != 'example'",
+		"\tSeLeCt\nCOUNT()\tFROM Account",
+	} {
+		err := q.Query(context.Background(), soql, func(map[string]interface{}) error {
+			t.Error("count-only query emitted a record")
+			return nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "count-only") || q.Usage().TotalCalls() != 0 {
+			t.Fatalf("error=%v usage=%+v", err, q.Usage())
+		}
+	}
+	for _, soql := range []string{
+		"SELECT COUNT(Id) FROM Account",
+		"SELECT Id FROM Account WHERE Name = 'SELECT COUNT() FROM Account'",
+	} {
+		if err := q.Query(context.Background(), soql, func(map[string]interface{}) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestQueryConcurrentRefreshUsesImmutableClients(t *testing.T) {
+	var mu sync.Mutex
+	rejected := []string{}
+	q, original := testQueries(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer token" {
+			w.WriteHeader(401)
+			return
+		}
+		fmt.Fprint(w, `{"totalSize":0,"done":true,"records":[]}`)
+	}, QueryOptions{})
+	fresh := *original
+	fresh.SetSidLoc("fresh", original.GetLoc())
+	// Both requests acquire the old Client before either can refresh it.
+	var ready sync.WaitGroup
+	ready.Add(2)
+	q.getClient = func(_ context.Context, sid string) (*Client, error) {
+		if sid == "" {
+			ready.Done()
+			ready.Wait()
+			return original, nil
+		}
+		mu.Lock()
+		rejected = append(rejected, sid)
+		mu.Unlock()
+		return &fresh, nil
+	}
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			errs <- q.Query(context.Background(), "SELECT Id FROM Account", func(map[string]interface{}) error { return nil })
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(rejected) != 2 || rejected[0] != "token" || rejected[1] != "token" || original.GetSid() != "token" {
+		t.Fatalf("rejected=%v original=%s", rejected, original.GetSid())
+	}
+	if u := q.Usage(); u.TotalCalls() != 4 || u.Retries != 0 {
+		t.Fatalf("usage=%+v", u)
+	}
+}
+
+func TestQueryUnrecognizedErrorBodies(t *testing.T) {
+	for _, body := range []string{"[]", "[{}]", "null", "<html>failure</html>", "unrecognized response"} {
+		t.Run(body, func(t *testing.T) {
+			q, _ := testQueries(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(400)
+				fmt.Fprint(w, body)
+			}, QueryOptions{})
+			_, err := q.Describe(context.Background(), "Product2")
+			var sfErr SalesforceError
+			if !errors.As(err, &sfErr) || sfErr.HttpCode != 400 || !strings.Contains(sfErr.Message, body) {
+				t.Fatalf("error=%v", err)
+			}
+		})
 	}
 }

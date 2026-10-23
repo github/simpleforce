@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,7 +55,9 @@ type QueryOptions struct {
 // QueryClient streams queries through an existing authenticated Client.
 // The provider receives an empty rejectedSID normally and the rejected session
 // ID on a 401, when it must bypass cached credentials and refresh authentication.
-// The provider owns authentication and synchronization of shared Clients.
+// The provider must be concurrency-safe and return Clients that remain immutable
+// while in use. Refresh must return a new Client, not call SetSidLoc (or other
+// setters/login methods) on a Client already returned to a query.
 type QueryClient struct {
 	getClient func(context.Context, string) (*Client, error)
 	options   QueryOptions
@@ -147,6 +150,7 @@ func (q *QueryClient) request(ctx context.Context, kind, method, path string, bo
 		if client == nil || client.sessionID == "" {
 			return nil, ErrAuthentication
 		}
+		sentSID := client.sessionID
 		relative, err := url.Parse(path)
 		if err != nil || relative.IsAbs() || relative.Host != "" || strings.HasPrefix(path, "//") {
 			return nil, fmt.Errorf("invalid Salesforce request path %q", path)
@@ -168,7 +172,7 @@ func (q *QueryClient) request(ctx context.Context, kind, method, path string, bo
 		}
 		if response != nil && requestErr == nil && response.StatusCode == http.StatusUnauthorized && !refreshed {
 			response.Body.Close()
-			client, err = q.getClient(ctx, client.sessionID)
+			client, err = q.getClient(ctx, sentSID)
 			if err != nil {
 				return nil, err
 			}
@@ -188,7 +192,7 @@ func (q *QueryClient) request(ctx context.Context, kind, method, path string, bo
 			if readErr != nil {
 				failure = fmt.Errorf("Salesforce HTTP %d: reading error body: %w", response.StatusCode, readErr)
 			} else {
-				failure = SalesforceError{HttpCode: response.StatusCode, Message: fmt.Sprintf("Salesforce HTTP %d: %s", response.StatusCode, data)}
+				failure = ParseSalesforceError(response.StatusCode, data)
 			}
 			if seconds, err := strconv.Atoi(response.Header.Get("Retry-After")); err == nil && seconds >= 0 {
 				delay = time.Duration(minInt(seconds, 60)) * time.Second
@@ -234,15 +238,28 @@ func (q *QueryClient) json(ctx context.Context, kind, method, path string, body 
 	if err := decoder.Decode(target); err != nil {
 		return fmt.Errorf("decode Salesforce %s response: %w", kind, err)
 	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode Salesforce %s response: unexpected trailing JSON document", kind)
+		}
+		return fmt.Errorf("finish Salesforce %s response: %w", kind, err)
+	}
 	return nil
 }
+
+var countOnlyQuery = regexp.MustCompile(`(?is)^\s*select\s+count\s*\(\s*\)\s+from\b`)
 
 // Query streams records page by page, preserving JSON numbers as json.Number
 // and relationships as nested maps. Callback errors stop pagination immediately.
 // A successful query validates the number of records against totalSize.
+// Count-only SELECT COUNT() queries are unsupported; use Client.Query instead.
 func (q *QueryClient) Query(ctx context.Context, soql string, emit func(map[string]interface{}) error) error {
 	if emit == nil || strings.TrimSpace(soql) == "" {
 		return fmt.Errorf("query and record callback are required")
+	}
+	if countOnlyQuery.MatchString(soql) {
+		return fmt.Errorf("count-only SELECT COUNT() queries are unsupported by streaming Query; use Client.Query")
 	}
 	path := "query?q=" + url.QueryEscape(soql)
 	seen := make(map[string]bool)
@@ -326,6 +343,8 @@ type bulkQueryJob struct {
 // BulkQuery creates a Bulk API 2.0 query job, waits for completion and streams
 // CSV rows. Keys use the caller's requested field spelling. Headers are matched
 // case-insensitively; missing/duplicate headers and result count mismatches fail.
+// Like encoding/csv, embedded CRLF values are normalized to LF; use Query when
+// exact multiline text preservation is required.
 // Cancellation stops local work; it does not send a separate abort request.
 func (q *QueryClient) BulkQuery(ctx context.Context, soql string, fields []string, emit func(map[string]string) error) error {
 	if strings.TrimSpace(soql) == "" || len(fields) == 0 || emit == nil {

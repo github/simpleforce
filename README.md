@@ -114,7 +114,8 @@ an opt-in helper that shares an authenticated `*Client` and its HTTP transport:
 queries, err := simpleforce.NewQueryClient(
     func(ctx context.Context, rejectedSID string) (*simpleforce.Client, error) {
         // Return your existing authenticated client. When rejectedSID is not
-        // empty, force a refresh of that rejected session, bypassing any TTL.
+        // empty, force a refresh of that rejected session, bypassing any TTL,
+        // and return a NEW Client. Never mutate a previously returned Client.
         return authenticatedClient(ctx, rejectedSID)
     },
     simpleforce.QueryOptions{},
@@ -138,12 +139,18 @@ usage := queries.Usage()
 ```
 
 `Query` emits each REST page before fetching the next and validates `totalSize`.
+Count-only `SELECT COUNT() FROM ...` queries are rejected before any HTTP call;
+use the existing `Client.Query` API and read `QueryResult.TotalSize` instead.
+Aggregates that return records, such as `COUNT(Id)`, are not count-only queries.
 `BulkQuery` creates and polls a Bulk API 2.0 query job, then streams CSV records
 without buffering a result page or table. CSV headers match requested fields
 case-insensitively; result keys preserve requested spelling. Missing or duplicate
 headers, malformed CSV, repeated/missing pagination locators, failed/aborted
 jobs, and result count mismatches return errors. Treat a failed export as
 incomplete: callbacks can run before a later validation error.
+As with Go's `encoding/csv`, embedded CRLF sequences in quoted CSV fields are
+normalized to LF. Use REST `Query` instead when exact multiline text preservation
+is required.
 
 Defaults are three transient retries, five-second polling, and 50,000 records per
 Bulk page. `QueryOptions` can override these and inject a context-aware `Sleep`;
@@ -156,8 +163,11 @@ than replaying already emitted records.
 
 Use a context deadline to bound polling, HTTP requests and backoff. Cancellation
 and callback errors stop local processing immediately; they do not submit a
-separate server-side job abort. The provider owns authentication and any
-synchronization needed when sharing or refreshing mutable clients.
+separate server-side job abort. The provider must be concurrency-safe and return
+clients that remain immutable while in use. A refresh must return a new `Client`;
+do not call `SetSidLoc`, `SetHttpClient`, login methods, or other mutating methods
+on a client already returned to a query. A lock inside the provider alone cannot
+protect concurrent request reads.
 `Usage()` reports attempted REST/describe/Bulk-create/poll/result calls, transient
 retries (excluding auth replays), and the latest nonempty `Sforce-Limit-Info`.
 `BulkJobsCreated` counts creation attempts, not confirmed server-side jobs.
