@@ -41,7 +41,7 @@ func (err SalesforceError) Error() string {
 func ParseSalesforceError(statusCode int, responseBody []byte) (err error) {
 	jsonError := jsonError{}
 	err = json.Unmarshal(responseBody, &jsonError)
-	if err == nil {
+	if err == nil && len(jsonError) > 0 && (jsonError[0].ErrorCode != "" || jsonError[0].Message != "") {
 		return SalesforceError{
 			Message: fmt.Sprintf(
 				logPrefix+" Error. http code: %v Error Message:  %v Error Code: %v",
@@ -55,7 +55,7 @@ func ParseSalesforceError(statusCode int, responseBody []byte) (err error) {
 
 	xmlError := xmlError{}
 	err = xml.Unmarshal(responseBody, &xmlError)
-	if err == nil {
+	if err == nil && (xmlError.ErrorCode != "" || xmlError.Message != "") {
 		return SalesforceError{
 			Message: fmt.Sprintf(
 				logPrefix+" Error. http code: %v Error Message:  %v Error Code: %v",

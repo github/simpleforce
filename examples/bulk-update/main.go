@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/simpleforce/simpleforce"
+	"github.com/github/simpleforce"
 )
 
 func main() {
